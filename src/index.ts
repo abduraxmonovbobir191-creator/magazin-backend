@@ -89,9 +89,9 @@ app.get("/api/reports/profit-loss", allowRoles("owner", "manager", "accountant",
   } catch (error) { next(error); }
 });
 
-app.get("/api/users", allowRoles("owner", "manager"), async (_req, res, next) => {
+app.get("/api/users", allowRoles("owner", "manager"), async (req: AuthRequest, res, next) => {
   try {
-    const result = await pool.query("SELECT id,username,full_name,role,branch_id,is_active,created_at FROM users ORDER BY created_at DESC");
+    const result = await pool.query("SELECT id,username,full_name,role,branch_id,is_active,created_at FROM users WHERE ($1::uuid IS NULL OR branch_id=$1) ORDER BY created_at DESC", [req.user?.branchId || null]);
     res.json({ items: result.rows });
   } catch (error) { next(error); }
 });
