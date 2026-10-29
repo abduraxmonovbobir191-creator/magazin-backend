@@ -162,6 +162,44 @@ app.post("/api/purchases", allowRoles("owner", "manager", "warehouse"), async (r
   } catch (error) { next(error); }
 });
 
+app.get("/api/cash-sessions/current", allowRoles("owner", "manager", "cashier"), async (req: AuthRequest, res, next) => {
+  try {
+    const result = await pool.query("SELECT id,opening_amount,status,opened_at,branch_id FROM cash_sessions WHERE cashier_id=$1 AND status='open' LIMIT 1", [req.user?.id]);
+    res.json({ session: result.rows[0] || null });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/cash-sessions/open", allowRoles("owner", "manager", "cashier"), async (req: AuthRequest, res, next) => {
+  try {
+    const input = z.object({ openingAmount: z.number().nonnegative().default(0) }).parse(req.body);
+    const existing = await pool.query("SELECT id FROM cash_sessions WHERE cashier_id=$1 AND status='open'", [req.user?.id]);
+    if (existing.rowCount) return res.status(409).json({ error: "Smena allaqachon ochilgan" });
+    const result = await pool.query("INSERT INTO cash_sessions (cashier_id,branch_id,opening_amount) VALUES ($1,$2,$3) RETURNING id,opening_amount,status,opened_at,branch_id", [req.user?.id,req.user?.branchId,input.openingAmount]);
+    await pool.query("INSERT INTO audit_logs (user_id,action,entity_type,entity_id,details) VALUES ($1,'cash_session.opened','cash_session',$2,$3::jsonb)", [req.user?.id,String(result.rows[0].id),JSON.stringify({ openingAmount: input.openingAmount })]);
+    res.status(201).json({ session: result.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/cash-sessions/close", allowRoles("owner", "manager", "cashier"), async (req: AuthRequest, res, next) => {
+  try {
+    const input = z.object({ countedClosingAmount: z.number().nonnegative() }).parse(req.body);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const found = await client.query("SELECT * FROM cash_sessions WHERE cashier_id=$1 AND status='open' FOR UPDATE", [req.user?.id]);
+      if (!found.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Ochiq smena topilmadi" }); }
+      const session = found.rows[0];
+      const cashSales = await client.query("SELECT COALESCE(SUM(amount),0) AS total FROM payments WHERE method='cash' AND created_by=$1 AND created_at >= $2", [req.user?.id,session.opened_at]);
+      const expected = money(Number(session.opening_amount) + Number(cashSales.rows[0].total));
+      const difference = money(input.countedClosingAmount - expected);
+      const result = await client.query("UPDATE cash_sessions SET expected_closing_amount=$2,counted_closing_amount=$3,difference_amount=$4,status='closed',closed_at=NOW() WHERE id=$1 RETURNING id,opening_amount,expected_closing_amount,counted_closing_amount,difference_amount,status,opened_at,closed_at", [session.id,expected,input.countedClosingAmount,difference]);
+      await client.query("INSERT INTO audit_logs (user_id,action,entity_type,entity_id,details) VALUES ($1,'cash_session.closed','cash_session',$2,$3::jsonb)", [req.user?.id,String(session.id),JSON.stringify({ expected, counted: input.countedClosingAmount, difference })]);
+      await client.query("COMMIT");
+      res.json({ session: result.rows[0] });
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  } catch (error) { next(error); }
+});
+
 app.get("/api/sales", async (req: AuthRequest, res, next) => {
   try {
     const branchId = req.user?.branchId;
