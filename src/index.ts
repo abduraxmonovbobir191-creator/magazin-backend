@@ -72,6 +72,96 @@ app.post("/api/products", allowRoles("owner", "manager", "warehouse"), async (re
   } catch (error) { next(error); }
 });
 
+app.get("/api/reports/profit-loss", allowRoles("owner", "manager", "accountant", "auditor"), async (req: AuthRequest, res, next) => {
+  try {
+    const input = z.object({ from: z.string().date().optional(), to: z.string().date().optional() }).parse(req.query);
+    const from = input.from || new Date().toISOString().slice(0, 10);
+    const to = input.to || from;
+    if (from > to) return res.status(400).json({ error: "Boshlanish sanasi tugash sanasidan keyin bo‘lishi mumkin emas" });
+    const branchId = req.user?.branchId;
+    const params: unknown[] = [from, to];
+    let branchFilter = "";
+    if (branchId) { params.push(branchId); branchFilter = ` AND branch_id = ${params.length}`; }
+    const sales = await pool.query(`SELECT COALESCE(SUM(total_amount),0) AS revenue, COALESCE(SUM(cost_amount),0) AS cogs, COALESCE(SUM(gross_profit),0) AS gross_profit, COUNT(*)::int AS sales_count FROM sales WHERE status='completed' AND sold_at::date BETWEEN $1::date AND $2::date${branchFilter}`, params);
+    const expenses = await pool.query(`SELECT COALESCE(SUM(amount),0) AS total FROM expenses WHERE expense_date BETWEEN $1::date AND $2::date${branchFilter}`, params);
+    const revenue = Number(sales.rows[0].revenue), cogs = Number(sales.rows[0].cogs), grossProfit = Number(sales.rows[0].gross_profit), expenseTotal = Number(expenses.rows[0].total);
+    res.json({ from, to, currency: "UZS", revenue, costOfGoodsSold: cogs, grossProfit, expenses: expenseTotal, operatingProfitBeforeTax: money(grossProfit - expenseTotal), salesCount: sales.rows[0].sales_count, note: "Soliqlar, foizlar va qayd qilinmagan xarajatlar ushbu ko‘rsatkichga kirmaydi." });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/users", allowRoles("owner", "manager"), async (_req, res, next) => {
+  try {
+    const result = await pool.query("SELECT id,username,full_name,role,branch_id,is_active,created_at FROM users ORDER BY created_at DESC");
+    res.json({ items: result.rows });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/users", allowRoles("owner"), async (req: AuthRequest, res, next) => {
+  try {
+    const input = z.object({ username: z.string().min(3).max(100).regex(/^[a-zA-Z0-9._-]+$/), password: z.string().min(14).max(200), fullName: z.string().min(1).max(200), role: z.enum(["manager","cashier","warehouse","accountant","auditor"]), branchId: z.string().uuid().optional().nullable() }).parse(req.body);
+    const hash = await bcrypt.hash(input.password, 12);
+    const result = await pool.query("INSERT INTO users (username,password_hash,full_name,role,branch_id) VALUES ($1,$2,$3,$4,$5) RETURNING id,username,full_name,role,branch_id,is_active,created_at", [input.username,hash,input.fullName,input.role,input.branchId || req.user?.branchId || null]);
+    await pool.query("INSERT INTO audit_logs (user_id,action,entity_type,entity_id,details) VALUES ($1,'user.created','user',$2,$3::jsonb)", [req.user?.id,String(result.rows[0].id),JSON.stringify({ username: input.username, role: input.role })]);
+    res.status(201).json({ item: result.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.patch("/api/users/:id/status", allowRoles("owner"), async (req: AuthRequest, res, next) => {
+  try {
+    const input = z.object({ isActive: z.boolean() }).parse(req.body);
+    if (req.params.id === req.user?.id && !input.isActive) return res.status(400).json({ error: "O‘z hisobingizni o‘chira olmaysiz" });
+    const result = await pool.query("UPDATE users SET is_active=$2,updated_at=NOW() WHERE id=$1 RETURNING id,username,full_name,role,branch_id,is_active", [req.params.id,input.isActive]);
+    if (!result.rowCount) return res.status(404).json({ error: "Xodim topilmadi" });
+    await pool.query("INSERT INTO audit_logs (user_id,action,entity_type,entity_id,details) VALUES ($1,'user.status_changed','user',$2,$3::jsonb)", [req.user?.id,req.params.id,JSON.stringify({ isActive: input.isActive })]);
+    res.json({ item: result.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/purchases", allowRoles("owner", "manager", "warehouse"), async (req: AuthRequest, res, next) => {
+  const schema = z.object({
+    supplierName: z.string().max(200).optional(),
+    items: z.array(z.object({ productId: z.string().uuid(), quantity: z.number().positive(), unitCost: z.number().nonnegative() })).min(1).max(200),
+    paidAmount: z.number().nonnegative().default(0),
+    note: z.string().max(1000).optional(),
+  });
+  try {
+    const input = schema.parse(req.body);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const lines: Array<{id:string;name:string;quantity:number;unitCost:number;total:number;branchId:string|null;oldQuantity:number;oldCost:number}> = [];
+      let total = 0;
+      for (const item of input.items) {
+        const found = await client.query("SELECT id,name,stock_quantity,purchase_price,branch_id FROM products WHERE id=$1 AND is_active=true FOR UPDATE", [item.productId]);
+        const product = found.rows[0];
+        if (!product) throw Object.assign(new Error("Mahsulot topilmadi"), { statusCode: 404 });
+        if (req.user?.branchId && product.branch_id !== req.user.branchId) throw Object.assign(new Error("Mahsulot ushbu filialga tegishli emas"), { statusCode: 403 });
+        const lineTotal = money(item.quantity * item.unitCost);
+        total = money(total + lineTotal);
+        lines.push({ id:String(product.id),name:product.name,quantity:item.quantity,unitCost:item.unitCost,total:lineTotal,branchId:product.branch_id ? String(product.branch_id) : null,oldQuantity:Number(product.stock_quantity),oldCost:Number(product.purchase_price) });
+      }
+      if (input.paidAmount > total) throw Object.assign(new Error("To‘langan summa xarid qiymatidan oshib ketdi"), { statusCode: 400 });
+      const purchase = await client.query("INSERT INTO purchase_documents (supplier_name,total_amount,paid_amount,status,branch_id,created_by,note) VALUES ($1,$2,$3,'received',$4,$5,$6) RETURNING *", [input.supplierName || null,total,input.paidAmount,req.user?.branchId,req.user?.id,input.note || null]);
+      for (const line of lines) {
+        await client.query("INSERT INTO purchase_items (purchase_id,product_id,quantity,unit_cost) VALUES ($1,$2,$3,$4)", [purchase.rows[0].id,line.id,line.quantity,line.unitCost]);
+        const newQty = line.oldQuantity + line.quantity;
+        const weightedCost = newQty > 0 ? money(((line.oldQuantity * line.oldCost) + (line.quantity * line.unitCost)) / newQty) : line.unitCost;
+        await client.query("UPDATE products SET stock_quantity=stock_quantity+$2,purchase_price=$3,updated_at=NOW() WHERE id=$1", [line.id,line.quantity,weightedCost]);
+        await client.query("INSERT INTO stock_movements (product_id,movement_type,quantity_delta,unit_cost,reference_type,reference_id,branch_id,created_by) VALUES ($1,'purchase',$2,$3,'purchase',$4,$5,$6)", [line.id,line.quantity,line.unitCost,purchase.rows[0].id,req.user?.branchId,req.user?.id]);
+      }
+      const unpaid = money(total - input.paidAmount);
+      if (unpaid > 0) {
+        if (!input.supplierName?.trim()) throw Object.assign(new Error("Qisman to‘lov uchun yetkazib beruvchi nomini kiriting"), { statusCode: 400 });
+        const debt = await client.query("INSERT INTO debts (direction,party_name,original_amount,paid_amount,remaining_amount,note,branch_id,created_by) VALUES ('payable',$1,$2,0,$2,$3,$4,$5) RETURNING id", [input.supplierName.trim(),unpaid,`Xarid hujjati ${purchase.rows[0].id}`,req.user?.branchId,req.user?.id]);
+        await client.query("INSERT INTO debt_transactions (debt_id,transaction_type,amount,note,created_by) VALUES ($1,'created',$2,'Xarid bo‘yicha qarz',$3)", [debt.rows[0].id,unpaid,req.user?.id]);
+      }
+      await client.query("INSERT INTO audit_logs (user_id,action,entity_type,entity_id,details) VALUES ($1,'purchase.received','purchase',$2,$3::jsonb)", [req.user?.id,String(purchase.rows[0].id),JSON.stringify({ total, paidAmount: input.paidAmount, itemCount: lines.length })]);
+      await client.query("COMMIT");
+      res.status(201).json({ purchase: purchase.rows[0], unpaid });
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  } catch (error) { next(error); }
+});
+
 app.get("/api/sales", async (req: AuthRequest, res, next) => {
   try {
     const branchId = req.user?.branchId;
