@@ -222,6 +222,10 @@ app.post("/api/sales", allowRoles("owner", "manager", "cashier"), async (req: Au
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    if (input.paymentMethod === "cash") {
+      const activeSession = await client.query("SELECT id FROM cash_sessions WHERE cashier_id=$1 AND status='open' FOR UPDATE", [req.user?.id]);
+      if (!activeSession.rowCount) throw Object.assign(new Error("Naqd savdo uchun avval kassa smenasini oching"), { statusCode: 409 });
+    }
     let subtotal = 0;
     let costAmount = 0;
     const lines: Array<{id:string;name:string;quantity:number;price:number;cost:number;total:number;costTotal:number;branchId:string|null}> = [];
