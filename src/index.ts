@@ -132,9 +132,11 @@ app.post("/api/sales", allowRoles("owner", "manager", "cashier"), async (req: Au
   } finally { client.release(); }
 });
 
-app.get("/api/expenses", async (_req, res, next) => {
-  try { const result = await pool.query("SELECT id,title,category,amount,expense_date,note FROM expenses ORDER BY expense_date DESC,created_at DESC LIMIT 200"); res.json({ items: result.rows }); }
-  catch (error) { next(error); }
+app.get("/api/expenses", async (req: AuthRequest, res, next) => {
+  try {
+    const result = await pool.query("SELECT id,title,category,amount,expense_date,note FROM expenses WHERE ($1::uuid IS NULL OR branch_id=$1) ORDER BY expense_date DESC,created_at DESC LIMIT 200", [req.user?.branchId || null]);
+    res.json({ items: result.rows });
+  } catch (error) { next(error); }
 });
 
 app.post("/api/expenses", allowRoles("owner", "manager", "accountant"), async (req: AuthRequest, res, next) => {
